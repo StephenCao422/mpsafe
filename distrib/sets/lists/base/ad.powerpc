@@ -1,0 +1,2 @@
+# $NetBSD: ad.powerpc,v 1.48 2024/04/09 15:17:22 nia Exp $
+./usr/bin/fdformat				base-util-bin
