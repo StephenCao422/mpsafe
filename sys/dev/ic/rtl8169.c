@@ -111,12 +111,23 @@ __KERNEL_RCSID(0, "$NetBSD: rtl8169.c,v 1.176 2024/06/29 12:11:11 riastradh Exp 
  * driver is 7500 bytes.
  */
 
+#ifdef _KERNEL_OPT
+#include "opt_net_mpsafe.h"
+#endif
+
+#ifdef 		NET_MPSAFE
+#define 	RE_MPSAFE		1
+#define 	CALLOUT_FLAGS	CALLOUT_MPSAFE
+#else
+#define 	CALLOUT_FLAGS	0
+#endif
 
 #include <sys/param.h>
 #include <sys/endian.h>
 #include <sys/systm.h>
 #include <sys/sockio.h>
 #include <sys/mbuf.h>
+#include <sys/mutex.h>
 #include <sys/kernel.h>
 #include <sys/socket.h>
 #include <sys/device.h>
@@ -898,6 +909,9 @@ re_attach(struct rtk_softc *sc)
 	strlcpy(ifp->if_xname, device_xname(sc->sc_dev), IFNAMSIZ);
 	ifp->if_mtu = ETHERMTU;
 	ifp->if_flags = IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST;
+#ifdef RE_MPSAFE
+	ifp->if_extflags = IFEF_MPSAFE;
+#endif
 	ifp->if_ioctl = re_ioctl;
 	sc->ethercom.ec_capabilities |=
 	    ETHERCAP_VLAN_MTU | ETHERCAP_VLAN_HWTAGGING;
@@ -921,8 +935,19 @@ re_attach(struct rtk_softc *sc)
 	ifp->if_capenable = ifp->if_capabilities;
 	IFQ_SET_READY(&ifp->if_snd);
 
-	callout_init(&sc->rtk_tick_ch, 0);
+	callout_init(&sc->rtk_tick_ch, CALLOUT_FLAGS);
 	callout_setfunc(&sc->rtk_tick_ch, re_tick, sc);
+
+	char wqname[MAXCOMLEN];
+	snprintf(wqname, sizeof(wqname), "%sReset", device_xname(sc->sc_dev));
+	error = workqueue_create(&sc->sc_reset_wq, wqname,
+	    aq_handle_reset_work, sc, PRI_SOFTNET, IPL_SOFTCLOCK,
+	    WQ_MPSAFE);
+	if (error) {
+		aprint_error_dev(sc->sc_dev,
+		    "unable to create reset workqueue\n");
+		goto attach_failure;
+	}
 
 	/* Do MII setup */
 	mii->mii_ifp = ifp;
@@ -930,8 +955,16 @@ re_attach(struct rtk_softc *sc)
 	mii->mii_writereg = re_miibus_writereg;
 	mii->mii_statchg = re_miibus_statchg;
 	sc->ethercom.ec_mii = mii;
+
+#ifdef RE_MPSAFE
+    mutex_init(&sc->sc_tx_lock, MUTEX_DEFAULT, IPL_NET);
+    mutex_init(&sc->sc_rx_lock, MUTEX_DEFAULT, IPL_NET);
+    ifmedia_init_with_lock(&mii->mii_media, IFM_IMASK, ether_mediachange, 
+		ether_mediastatus, &sc->sc_rx_lock);
+#else
 	ifmedia_init(&mii->mii_media, IFM_IMASK, ether_mediachange,
 	    ether_mediastatus);
+#endif
 	mii_attach(sc->sc_dev, mii, 0xffffffff, MII_PHY_ANY,
 	    MII_OFFSET_ANY, 0);
 	ifmedia_set(&mii->mii_media, IFM_ETHER | IFM_AUTO);
@@ -1243,6 +1276,9 @@ re_rxeof(struct rtk_softc *sc)
 
 	ifp = &sc->ethercom.ec_if;
 
+	RE_RX_LOCK(sc);
+	KASSERT(RE_RX_LOCKED(sc)); // assert RX lock is held
+
 	for (i = sc->re_ldata.re_rx_prodidx;; i = RE_NEXT_RX_DESC(sc, i)) {
 		cur_rx = &sc->re_ldata.re_rx_list[i];
 		RE_RXDESCSYNC(sc, i,
@@ -1432,6 +1468,8 @@ re_rxeof(struct rtk_softc *sc)
 	}
 
 	sc->re_ldata.re_rx_prodidx = i;
+
+	RE_RX_UNLOCK(sc);
 }
 
 static void
@@ -1443,6 +1481,9 @@ re_txeof(struct rtk_softc *sc)
 	int idx, descidx;
 
 	ifp = &sc->ethercom.ec_if;
+
+	RE_TX_LOCK(sc);
+	KASSERT(RE_TX_LOCKED(sc)); // assert TX lock is held
 
 	for (idx = sc->re_ldata.re_txq_considx;
 	    sc->re_ldata.re_txq_free < RE_TX_QLEN;
@@ -1507,19 +1548,27 @@ re_txeof(struct rtk_softc *sc)
 		}
 	} else
 		ifp->if_timer = 0;
+
+	RE_TX_UNLOCK(sc);
 }
 
 static void
 re_tick(void *arg)
 {
 	struct rtk_softc *sc = arg;
-	int s;
+	// int s;
 
 	/* XXX: just return for 8169S/8110S with rev 2 or newer phy */
-	s = splnet();
+	// s = splnet();
+
+	RE_TX_LOCK(sc);
+    RE_RX_LOCK(sc);
 
 	mii_tick(&sc->mii);
-	splx(s);
+	// splx(s);
+
+	RE_TX_UNLOCK(sc);
+    RE_RX_UNLOCK(sc);
 
 	callout_schedule(&sc->rtk_tick_ch, hz);
 }
@@ -1531,6 +1580,8 @@ re_intr(void *arg)
 	struct ifnet *ifp;
 	uint16_t status, rndstatus = 0;
 	int handled = 0;
+
+	KASSERT(KERNEL_LOCKED_P());
 
 	if (!device_has_power(sc->sc_dev))
 		return 0;
@@ -1605,9 +1656,15 @@ re_start(struct ifnet *ifp)
 	sc = ifp->if_softc;
 	ofree = sc->re_ldata.re_txq_free;
 
+	RE_TX_LOCK(sc);
+
+	if ((ifp->if_flags & (IFF_RUNNING|IFF_OACTIVE)) != IFF_RUNNING){
+		goto out;
+	}
+
 	for (idx = sc->re_ldata.re_txq_prodidx;; idx = RE_NEXT_TXQ(sc, idx)) {
 
-		IFQ_POLL(&ifp->if_snd, m);
+		IFQ_POLL(&ifp->if_snd, m);	//IFQ_DEQUEUE(&ifp->if_snd, m);
 		if (m == NULL)
 			break;
 
@@ -1841,11 +1898,18 @@ re_start(struct ifnet *ifp)
 			CSR_WRITE_4(sc, RTK_TIMERCNT, 1);
 		}
 
+	// if (m != NULL) {
+	// 	ifp->if_flags |= IFF_OACTIVE;
+	// 	m_freem(m);
+	// }
+
 		/*
 		 * Set a timeout in case the chip goes out to lunch.
 		 */
 		ifp->if_timer = 5;
 	}
+out:
+	RE_TX_UNLOCK(sc);
 }
 
 static int
@@ -1859,6 +1923,8 @@ re_init(struct ifnet *ifp)
 	const uint8_t *enaddr;
 	uint32_t reg;
 #endif
+
+	RE_LOCK(sc);
 
 	if ((error = re_enable(sc)) != 0)
 		goto out;
@@ -2093,6 +2159,8 @@ re_init(struct ifnet *ifp)
 		    device_xname(sc->sc_dev));
 	}
 
+	RE_UNLOCK(sc);
+	
 	return error;
 }
 

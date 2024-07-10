@@ -228,7 +228,26 @@ struct rtk_softc {
 	void	(*sc_disable)	(struct rtk_softc *);
 
 	krndsource_t     rnd_source;
+
+    kmutex_t        sc_tx_lock;
+    kmutex_t        sc_rx_lock;
 };
+
+#ifdef RE_MPSAFE
+#define RE_TX_LOCK(_sc)    mutex_enter(&(_sc)->sc_tx_lock)
+#define RE_TX_UNLOCK(_sc)  mutex_exit(&(_sc)->sc_tx_lock)
+#define RE_TX_LOCKED(_sc)  (mutex_owned(&(_sc)->sc_tx_lock))
+#define RE_RX_LOCK(_sc)    mutex_enter(&(_sc)->sc_rx_lock)
+#define RE_RX_UNLOCK(_sc)  mutex_exit(&(_sc)->sc_rx_lock)
+#define RE_RX_LOCKED(_sc)  (mutex_owned(&(_sc)->sc_rx_lock))
+#else
+#define RE_TX_LOCK(_sc)
+#define RE_TX_UNLOCK(_sc)
+#define RE_TX_LOCKED(_sc)  (1)
+#define RE_RX_LOCK(_sc)
+#define RE_RX_UNLOCK(_sc)
+#define RE_RX_LOCKED(_sc)  (1)
+#endif
 
 #define RE_TX_DESC_CNT(sc)	((sc)->re_ldata.re_tx_desc_cnt)
 #define RE_TX_LIST_SZ(sc)	(RE_TX_DESC_CNT(sc) * sizeof(struct re_desc))
