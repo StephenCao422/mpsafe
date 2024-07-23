@@ -231,6 +231,7 @@ struct rtk_softc {
 
     kmutex_t        sc_tx_lock;
     kmutex_t        sc_rx_lock;
+	bool			sc_stopping;
 };
 
 #ifdef RE_MPSAFE

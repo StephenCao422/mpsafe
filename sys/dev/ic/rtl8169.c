@@ -959,6 +959,7 @@ re_attach(struct rtk_softc *sc)
 #ifdef RE_MPSAFE
     mutex_init(&sc->sc_tx_lock, MUTEX_DEFAULT, IPL_NET);
     mutex_init(&sc->sc_rx_lock, MUTEX_DEFAULT, IPL_NET);
+	sc->sc_stopping = false;
     ifmedia_init_with_lock(&mii->mii_media, IFM_IMASK, ether_mediachange, 
 		ether_mediastatus, &sc->sc_rx_lock);
 #else
@@ -1279,6 +1280,11 @@ re_rxeof(struct rtk_softc *sc)
 	RE_RX_LOCK(sc);
 	KASSERT(RE_RX_LOCKED(sc)); // assert RX lock is held
 
+	if(sc->sc_stopping) {
+		RE_RX_UNLOCK(sc);
+		return;
+	}
+
 	for (i = sc->re_ldata.re_rx_prodidx;; i = RE_NEXT_RX_DESC(sc, i)) {
 		cur_rx = &sc->re_ldata.re_rx_list[i];
 		RE_RXDESCSYNC(sc, i,
@@ -1485,6 +1491,11 @@ re_txeof(struct rtk_softc *sc)
 	RE_TX_LOCK(sc);
 	KASSERT(RE_TX_LOCKED(sc)); // assert TX lock is held
 
+	if(sc->sc_stopping) {
+		RE_TX_UNLOCK(sc);
+		return;
+	}
+
 	for (idx = sc->re_ldata.re_txq_considx;
 	    sc->re_ldata.re_txq_free < RE_TX_QLEN;
 	    idx = RE_NEXT_TXQ(sc, idx), sc->re_ldata.re_txq_free++) {
@@ -1657,6 +1668,9 @@ re_start(struct ifnet *ifp)
 	ofree = sc->re_ldata.re_txq_free;
 
 	RE_TX_LOCK(sc);
+	if(sc->sc_stopping){
+		goto out;
+	}
 
 	if ((ifp->if_flags & (IFF_RUNNING|IFF_OACTIVE)) != IFF_RUNNING){
 		goto out;
@@ -2239,6 +2253,10 @@ re_stop(struct ifnet *ifp, int disable)
 	int i;
 	struct rtk_softc *sc = ifp->if_softc;
 
+	RE_TX_LOCK(sc);
+	RE_RX_LOCK(sc);
+	sc->sc_stopping = true;
+
 	callout_stop(&sc->rtk_tick_ch);
 
 	mii_down(&sc->mii);
@@ -2282,4 +2300,7 @@ re_stop(struct ifnet *ifp, int disable)
 
 	ifp->if_flags &= ~(IFF_RUNNING | IFF_OACTIVE);
 	ifp->if_timer = 0;
+
+	RE_TX_UNLOCK(sc);
+	RE_RX_UNLOCK(sc);
 }
