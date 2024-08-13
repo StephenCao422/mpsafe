@@ -938,16 +938,16 @@ re_attach(struct rtk_softc *sc)
 	callout_init(&sc->rtk_tick_ch, CALLOUT_FLAGS);
 	callout_setfunc(&sc->rtk_tick_ch, re_tick, sc);
 
-	char wqname[MAXCOMLEN];
-	snprintf(wqname, sizeof(wqname), "%sReset", device_xname(sc->sc_dev));
-	error = workqueue_create(&sc->sc_reset_wq, wqname,
-	    aq_handle_reset_work, sc, PRI_SOFTNET, IPL_SOFTCLOCK,
-	    WQ_MPSAFE);
-	if (error) {
-		aprint_error_dev(sc->sc_dev,
-		    "unable to create reset workqueue\n");
-		goto attach_failure;
-	}
+	// char wqname[MAXCOMLEN];
+	// snprintf(wqname, sizeof(wqname), "%sReset", device_xname(sc->sc_dev));
+	// error = workqueue_create(&sc->sc_reset_wq, wqname,
+	//     aq_handle_reset_work, sc, PRI_SOFTNET, IPL_SOFTCLOCK,
+	//     WQ_MPSAFE);
+	// if (error) {
+	// 	aprint_error_dev(sc->sc_dev,
+	// 	    "unable to create reset workqueue\n");
+	// 	goto attach_failure;
+	// }
 
 	/* Do MII setup */
 	mii->mii_ifp = ifp;
