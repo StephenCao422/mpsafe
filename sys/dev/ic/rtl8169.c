@@ -1,4 +1,4 @@
-/*	$NetBSD: rtl8169.c,v 1.176 2024/06/29 12:11:11 riastradh Exp $	*/
+/*	$NetBSD: rtl8169.c,v 1.177 2024/07/05 04:31:51 rin Exp $	*/
 
 /*
  * Copyright (c) 1997, 1998-2003
@@ -33,7 +33,7 @@
  */
 
 #include <sys/cdefs.h>
-__KERNEL_RCSID(0, "$NetBSD: rtl8169.c,v 1.176 2024/06/29 12:11:11 riastradh Exp $");
+__KERNEL_RCSID(0, "$NetBSD: rtl8169.c,v 1.177 2024/07/05 04:31:51 rin Exp $");
 /* $FreeBSD: /repoman/r/ncvs/src/sys/dev/re/if_re.c,v 1.20 2004/04/11 20:34:08 ru Exp $ */
 
 /*
@@ -111,23 +111,12 @@ __KERNEL_RCSID(0, "$NetBSD: rtl8169.c,v 1.176 2024/06/29 12:11:11 riastradh Exp 
  * driver is 7500 bytes.
  */
 
-#ifdef _KERNEL_OPT
-#include "opt_net_mpsafe.h"
-#endif
-
-#ifdef 		NET_MPSAFE
-#define 	RE_MPSAFE		1
-#define 	CALLOUT_FLAGS	CALLOUT_MPSAFE
-#else
-#define 	CALLOUT_FLAGS	0
-#endif
 
 #include <sys/param.h>
 #include <sys/endian.h>
 #include <sys/systm.h>
 #include <sys/sockio.h>
 #include <sys/mbuf.h>
-#include <sys/mutex.h>
 #include <sys/kernel.h>
 #include <sys/socket.h>
 #include <sys/device.h>
@@ -306,19 +295,23 @@ re_miibus_readreg(device_t dev, int phy, int reg, uint16_t *val)
 {
 	struct rtk_softc *sc = device_private(dev);
 	uint16_t re8139_reg = 0;
-	int s, rv = 0;
+	// int s, rv = 0;
+	int rv = 0;
 
-	s = splnet();
+	// s = splnet();
+	RE_LOCK(sc);
 
 	if ((sc->sc_quirk & RTKQ_8139CPLUS) == 0) {
 		rv = re_gmii_readreg(dev, phy, reg, val);
-		splx(s);
+		// splx(s);
+		RE_UNLOCK(sc);
 		return rv;
 	}
 
 	/* Pretend the internal PHY is only at address 0 */
 	if (phy) {
-		splx(s);
+		// splx(s);
+		RE_UNLOCK(sc);
 		return -1;
 	}
 	switch (reg) {
@@ -340,7 +333,8 @@ re_miibus_readreg(device_t dev, int phy, int reg, uint16_t *val)
 	case MII_PHYIDR1:
 	case MII_PHYIDR2:
 		*val = 0;
-		splx(s);
+		// splx(s);
+		RE_UNLOCK(sc);
 		return 0;
 	/*
 	 * Allow the rlphy driver to read the media status
@@ -350,11 +344,13 @@ re_miibus_readreg(device_t dev, int phy, int reg, uint16_t *val)
 	 */
 	case RTK_MEDIASTAT:
 		*val = CSR_READ_1(sc, RTK_MEDIASTAT);
-		splx(s);
+		// splx(s);
+		RE_UNLOCK(sc);
 		return 0;
 	default:
 		printf("%s: bad phy register\n", device_xname(sc->sc_dev));
-		splx(s);
+		// splx(s);
+		RE_UNLOCK(sc);
 		return -1;
 	}
 	*val = CSR_READ_2(sc, re8139_reg);
@@ -362,7 +358,8 @@ re_miibus_readreg(device_t dev, int phy, int reg, uint16_t *val)
 		/* 8139C+ has different bit layout. */
 		*val &= ~(BMCR_LOOP | BMCR_ISO);
 	}
-	splx(s);
+	// splx(s);
+	RE_UNLOCK(sc);
 	return 0;
 }
 
@@ -371,19 +368,23 @@ re_miibus_writereg(device_t dev, int phy, int reg, uint16_t val)
 {
 	struct rtk_softc *sc = device_private(dev);
 	uint16_t re8139_reg = 0;
-	int s, rv;
+	// int s, rv;
+	int rv;
 
-	s = splnet();
+	// s = splnet();
+	RE_LOCK(sc);
 
 	if ((sc->sc_quirk & RTKQ_8139CPLUS) == 0) {
 		rv = re_gmii_writereg(dev, phy, reg, val);
-		splx(s);
+		// splx(s);
+		RE_UNLOCK(sc);
 		return rv;
 	}
 
 	/* Pretend the internal PHY is only at address 0 */
 	if (phy) {
-		splx(s);
+		// splx(s);
+		RE_UNLOCK(sc);
 		return -1;
 	}
 	switch (reg) {
@@ -408,16 +409,19 @@ re_miibus_writereg(device_t dev, int phy, int reg, uint16_t val)
 		break;
 	case MII_PHYIDR1:
 	case MII_PHYIDR2:
-		splx(s);
+		// splx(s);
+		RE_UNLOCK(sc);
 		return 0;
 		break;
 	default:
 		printf("%s: bad phy register\n", device_xname(sc->sc_dev));
-		splx(s);
+		// splx(s);
+		RE_UNLOCK(sc);
 		return -1;
 	}
 	CSR_WRITE_2(sc, re8139_reg, val);
-	splx(s);
+	// splx(s);
+	RE_UNLOCK(sc);
 	return 0;
 }
 
@@ -484,7 +488,8 @@ re_diag(struct rtk_softc *sc)
 	bus_dmamap_t dmamap;
 	uint16_t status;
 	uint32_t rxstat;
-	int total_len, i, s, error = 0;
+	// int total_len, i, s, error = 0;
+	int total_len, i, error = 0;
 	static const uint8_t dst[] = { 0x00, 'h', 'e', 'l', 'l', 'o' };
 	static const uint8_t src[] = { 0x00, 'w', 'o', 'r', 'l', 'd' };
 
@@ -493,6 +498,8 @@ re_diag(struct rtk_softc *sc)
 	MGETHDR(m0, M_DONTWAIT, MT_DATA);
 	if (m0 == NULL)
 		return ENOBUFS;
+
+	RE_LOCK(sc);
 
 	/*
 	 * Initialize the NIC in test mode. This sets the chip up
@@ -523,10 +530,12 @@ re_diag(struct rtk_softc *sc)
 	 */
 
 	CSR_WRITE_2(sc, RTK_ISR, 0xFFFF);
-	s = splnet();
+	// s = splnet();
+	RE_UNLOCK(sc);
 	IF_ENQUEUE(&ifp->if_snd, m0);
 	re_start(ifp);
-	splx(s);
+	// splx(s);
+	RE_LOCK(sc);
 	m0 = NULL;
 
 	/* Wait for it to propagate through the chip */
@@ -599,8 +608,9 @@ re_diag(struct rtk_softc *sc)
 	sc->re_testmode = 0;
 	ifp->if_flags &= ~IFF_PROMISC;
 	re_stop(ifp, 0);
-	if (m0 != NULL)
-		m_freem(m0);
+	m_freem(m0);
+
+	RE_UNLOCK(sc);
 
 	return error;
 }
@@ -741,7 +751,9 @@ re_attach(struct rtk_softc *sc)
 	}
 
 	/* Reset the adapter. */
+	RE_LOCK(sc);
 	re_reset(sc);
+	RE_UNLOCK(sc);
 
 	/*
 	 * RTL81x9 chips automatically read EEPROM to init MAC address,
@@ -909,9 +921,6 @@ re_attach(struct rtk_softc *sc)
 	strlcpy(ifp->if_xname, device_xname(sc->sc_dev), IFNAMSIZ);
 	ifp->if_mtu = ETHERMTU;
 	ifp->if_flags = IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST;
-#ifdef RE_MPSAFE
-	ifp->if_extflags = IFEF_MPSAFE;
-#endif
 	ifp->if_ioctl = re_ioctl;
 	sc->ethercom.ec_capabilities |=
 	    ETHERCAP_VLAN_MTU | ETHERCAP_VLAN_HWTAGGING;
@@ -935,19 +944,8 @@ re_attach(struct rtk_softc *sc)
 	ifp->if_capenable = ifp->if_capabilities;
 	IFQ_SET_READY(&ifp->if_snd);
 
-	callout_init(&sc->rtk_tick_ch, CALLOUT_FLAGS);
+	callout_init(&sc->rtk_tick_ch, 0);
 	callout_setfunc(&sc->rtk_tick_ch, re_tick, sc);
-
-	// char wqname[MAXCOMLEN];
-	// snprintf(wqname, sizeof(wqname), "%sReset", device_xname(sc->sc_dev));
-	// error = workqueue_create(&sc->sc_reset_wq, wqname,
-	//     aq_handle_reset_work, sc, PRI_SOFTNET, IPL_SOFTCLOCK,
-	//     WQ_MPSAFE);
-	// if (error) {
-	// 	aprint_error_dev(sc->sc_dev,
-	// 	    "unable to create reset workqueue\n");
-	// 	goto attach_failure;
-	// }
 
 	/* Do MII setup */
 	mii->mii_ifp = ifp;
@@ -955,17 +953,8 @@ re_attach(struct rtk_softc *sc)
 	mii->mii_writereg = re_miibus_writereg;
 	mii->mii_statchg = re_miibus_statchg;
 	sc->ethercom.ec_mii = mii;
-
-#ifdef RE_MPSAFE
-    mutex_init(&sc->sc_tx_lock, MUTEX_DEFAULT, IPL_NET);
-    mutex_init(&sc->sc_rx_lock, MUTEX_DEFAULT, IPL_NET);
-	sc->sc_stopping = false;
-    ifmedia_init_with_lock(&mii->mii_media, IFM_IMASK, ether_mediachange, 
-		ether_mediastatus, &sc->sc_rx_lock);
-#else
 	ifmedia_init(&mii->mii_media, IFM_IMASK, ether_mediachange,
 	    ether_mediastatus);
-#endif
 	mii_attach(sc->sc_dev, mii, 0xffffffff, MII_PHY_ANY,
 	    MII_OFFSET_ANY, 0);
 	ifmedia_set(&mii->mii_media, IFM_ETHER | IFM_AUTO);
@@ -1214,8 +1203,7 @@ re_newbuf(struct rtk_softc *sc, int idx, struct mbuf *m)
 
 	return 0;
  out:
-	if (n != NULL)
-		m_freem(n);
+	m_freem(n);
 	return ENOMEM;
 }
 
@@ -1223,6 +1211,8 @@ static int
 re_tx_list_init(struct rtk_softc *sc)
 {
 	int i;
+	
+	RE_LOCK_ASSERT(sc);
 
 	memset(sc->re_ldata.re_tx_list, 0, RE_TX_LIST_SZ(sc));
 	for (i = 0; i < RE_TX_QLEN; i++) {
@@ -1275,15 +1265,9 @@ re_rxeof(struct rtk_softc *sc)
 	struct re_rxsoft *rxs;
 	uint32_t rxstat, rxvlan;
 
+	// RE_LOCK_ASSERT(sc);
+
 	ifp = &sc->ethercom.ec_if;
-
-	RE_RX_LOCK(sc);
-	KASSERT(RE_RX_LOCKED(sc)); // assert RX lock is held
-
-	if(sc->sc_stopping) {
-		RE_RX_UNLOCK(sc);
-		return;
-	}
 
 	for (i = sc->re_ldata.re_rx_prodidx;; i = RE_NEXT_RX_DESC(sc, i)) {
 		cur_rx = &sc->re_ldata.re_rx_list[i];
@@ -1474,8 +1458,6 @@ re_rxeof(struct rtk_softc *sc)
 	}
 
 	sc->re_ldata.re_rx_prodidx = i;
-
-	RE_RX_UNLOCK(sc);
 }
 
 static void
@@ -1487,14 +1469,6 @@ re_txeof(struct rtk_softc *sc)
 	int idx, descidx;
 
 	ifp = &sc->ethercom.ec_if;
-
-	RE_TX_LOCK(sc);
-	KASSERT(RE_TX_LOCKED(sc)); // assert TX lock is held
-
-	if(sc->sc_stopping) {
-		RE_TX_UNLOCK(sc);
-		return;
-	}
 
 	for (idx = sc->re_ldata.re_txq_considx;
 	    sc->re_ldata.re_txq_free < RE_TX_QLEN;
@@ -1559,8 +1533,6 @@ re_txeof(struct rtk_softc *sc)
 		}
 	} else
 		ifp->if_timer = 0;
-
-	RE_TX_UNLOCK(sc);
 }
 
 static void
@@ -1571,15 +1543,11 @@ re_tick(void *arg)
 
 	/* XXX: just return for 8169S/8110S with rev 2 or newer phy */
 	// s = splnet();
-
-	RE_TX_LOCK(sc);
-    RE_RX_LOCK(sc);
+	RE_LOCK(sc);
 
 	mii_tick(&sc->mii);
 	// splx(s);
-
-	RE_TX_UNLOCK(sc);
-    RE_RX_UNLOCK(sc);
+	RE_UNLOCK(sc);
 
 	callout_schedule(&sc->rtk_tick_ch, hz);
 }
@@ -1592,7 +1560,7 @@ re_intr(void *arg)
 	uint16_t status, rndstatus = 0;
 	int handled = 0;
 
-	KASSERT(KERNEL_LOCKED_P());
+	RE_LOCK(sc);
 
 	if (!device_has_power(sc->sc_dev))
 		return 0;
@@ -1642,6 +1610,8 @@ re_intr(void *arg)
 
 	rnd_add_uint32(&sc->rnd_source, rndstatus);
 
+	RE_UNLOCK(sc);
+
 	return handled;
 }
 
@@ -1667,18 +1637,11 @@ re_start(struct ifnet *ifp)
 	sc = ifp->if_softc;
 	ofree = sc->re_ldata.re_txq_free;
 
-	RE_TX_LOCK(sc);
-	if(sc->sc_stopping){
-		goto out;
-	}
-
-	if ((ifp->if_flags & (IFF_RUNNING|IFF_OACTIVE)) != IFF_RUNNING){
-		goto out;
-	}
+	RE_LOCK(sc);
 
 	for (idx = sc->re_ldata.re_txq_prodidx;; idx = RE_NEXT_TXQ(sc, idx)) {
 
-		IFQ_POLL(&ifp->if_snd, m);	//IFQ_DEQUEUE(&ifp->if_snd, m);
+		IFQ_POLL(&ifp->if_snd, m);
 		if (m == NULL)
 			break;
 
@@ -1912,18 +1875,12 @@ re_start(struct ifnet *ifp)
 			CSR_WRITE_4(sc, RTK_TIMERCNT, 1);
 		}
 
-	// if (m != NULL) {
-	// 	ifp->if_flags |= IFF_OACTIVE;
-	// 	m_freem(m);
-	// }
-
 		/*
 		 * Set a timeout in case the chip goes out to lunch.
 		 */
 		ifp->if_timer = 5;
 	}
-out:
-	RE_TX_UNLOCK(sc);
+	RE_UNLOCK(sc);
 }
 
 static int
@@ -1937,8 +1894,6 @@ re_init(struct ifnet *ifp)
 	const uint8_t *enaddr;
 	uint32_t reg;
 #endif
-
-	RE_LOCK(sc);
 
 	if ((error = re_enable(sc)) != 0)
 		goto out;
@@ -2173,8 +2128,6 @@ re_init(struct ifnet *ifp)
 		    device_xname(sc->sc_dev));
 	}
 
-	RE_UNLOCK(sc);
-	
 	return error;
 }
 
@@ -2183,9 +2136,11 @@ re_ioctl(struct ifnet *ifp, u_long command, void *data)
 {
 	struct rtk_softc *sc = ifp->if_softc;
 	struct ifreq *ifr = data;
-	int s, error = 0;
+	// int s, error = 0;
+	int error = 0;
 
-	s = splnet();
+	// s = splnet();
+	RE_LOCK(sc);
 
 	switch (command) {
 	case SIOCSIFMTU:
@@ -2219,7 +2174,8 @@ re_ioctl(struct ifnet *ifp, u_long command, void *data)
 		break;
 	}
 
-	splx(s);
+	// splx(s);
+	RE_UNLOCK(sc);
 
 	return error;
 }
@@ -2228,10 +2184,11 @@ static void
 re_watchdog(struct ifnet *ifp)
 {
 	struct rtk_softc *sc;
-	int s;
+	// int s;
 
 	sc = ifp->if_softc;
-	s = splnet();
+	// s = splnet();
+	RE_LOCK(sc);
 	printf("%s: watchdog timeout\n", device_xname(sc->sc_dev));
 	if_statinc(ifp, if_oerrors);
 
@@ -2240,7 +2197,8 @@ re_watchdog(struct ifnet *ifp)
 
 	re_init(ifp);
 
-	splx(s);
+	// splx(s);
+	RE_UNLOCK(sc);
 }
 
 /*
@@ -2253,9 +2211,7 @@ re_stop(struct ifnet *ifp, int disable)
 	int i;
 	struct rtk_softc *sc = ifp->if_softc;
 
-	RE_TX_LOCK(sc);
-	RE_RX_LOCK(sc);
-	sc->sc_stopping = true;
+	RE_LOCK(sc);
 
 	callout_stop(&sc->rtk_tick_ch);
 
@@ -2301,6 +2257,5 @@ re_stop(struct ifnet *ifp, int disable)
 	ifp->if_flags &= ~(IFF_RUNNING | IFF_OACTIVE);
 	ifp->if_timer = 0;
 
-	RE_TX_UNLOCK(sc);
-	RE_RX_UNLOCK(sc);
+	RE_UNLOCK(sc);
 }
