@@ -630,6 +630,8 @@ re_attach(struct rtk_softc *sc)
 	const struct re_revision *rr;
 	const char *re_name = NULL;
 
+	mutex_init(&sc->sc_mtx, MUTEX_DEFAULT, IPL_NET);
+
 	if ((sc->sc_quirk & RTKQ_8139CPLUS) == 0) {
 		/* Revision of 8169/8169S/8110s in bits 30..26, 23 */
 		sc->sc_hwrev = CSR_READ_4(sc, RTK_TXCFG) & RTK_TXCFG_HWREV;
@@ -1097,6 +1099,8 @@ re_detach(struct rtk_softc *sc)
 	/* we don't want to run again */
 	sc->sc_flags &= ~RTK_ATTACHED;
 
+	mutex_destroy(&sc->sc_mtx);
+
 	return 0;
 }
 
@@ -1265,7 +1269,7 @@ re_rxeof(struct rtk_softc *sc)
 	struct re_rxsoft *rxs;
 	uint32_t rxstat, rxvlan;
 
-	// RE_LOCK_ASSERT(sc);
+	RE_LOCK_ASSERT(sc);
 
 	ifp = &sc->ethercom.ec_if;
 
@@ -1454,7 +1458,9 @@ re_rxeof(struct rtk_softc *sc)
 			vlan_set_tag(m,
 			     bswap16(rxvlan & RE_RDESC_VLANCTL_DATA));
 		}
+		RE_UNLOCK(sc);
 		if_percpuq_enqueue(ifp->if_percpuq, m);
+		RE_LOCK(sc);
 	}
 
 	sc->re_ldata.re_rx_prodidx = i;
