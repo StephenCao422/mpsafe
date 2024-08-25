@@ -153,9 +153,12 @@ static int re_tx_list_init(struct rtk_softc *);
 static void re_rxeof(struct rtk_softc *);
 static void re_txeof(struct rtk_softc *);
 static void re_tick(void *);
+static void re_tick_locked(struct rl_softc *);
 static void re_start(struct ifnet *);
+static void re_start_locked(struct ifnet *);
 static int re_ioctl(struct ifnet *, u_long, void *);
 static int re_init(struct ifnet *);
+static int re_int_locked(struct ifnet *);
 static void re_stop(struct ifnet *, int);
 static void re_watchdog(struct ifnet *);
 
@@ -299,12 +302,12 @@ re_miibus_readreg(device_t dev, int phy, int reg, uint16_t *val)
 	int rv = 0;
 
 	// s = splnet();
-	RE_LOCK(sc);
+	// RE_LOCK(sc);
 
 	if ((sc->sc_quirk & RTKQ_8139CPLUS) == 0) {
 		rv = re_gmii_readreg(dev, phy, reg, val);
 		// splx(s);
-		RE_UNLOCK(sc);
+		// RE_UNLOCK(sc);
 		return rv;
 	}
 
@@ -334,7 +337,7 @@ re_miibus_readreg(device_t dev, int phy, int reg, uint16_t *val)
 	case MII_PHYIDR2:
 		*val = 0;
 		// splx(s);
-		RE_UNLOCK(sc);
+		// RE_UNLOCK(sc);
 		return 0;
 	/*
 	 * Allow the rlphy driver to read the media status
@@ -345,12 +348,12 @@ re_miibus_readreg(device_t dev, int phy, int reg, uint16_t *val)
 	case RTK_MEDIASTAT:
 		*val = CSR_READ_1(sc, RTK_MEDIASTAT);
 		// splx(s);
-		RE_UNLOCK(sc);
+		// RE_UNLOCK(sc);
 		return 0;
 	default:
 		printf("%s: bad phy register\n", device_xname(sc->sc_dev));
 		// splx(s);
-		RE_UNLOCK(sc);
+		// RE_UNLOCK(sc);
 		return -1;
 	}
 	*val = CSR_READ_2(sc, re8139_reg);
@@ -359,7 +362,7 @@ re_miibus_readreg(device_t dev, int phy, int reg, uint16_t *val)
 		*val &= ~(BMCR_LOOP | BMCR_ISO);
 	}
 	// splx(s);
-	RE_UNLOCK(sc);
+	// RE_UNLOCK(sc);
 	return 0;
 }
 
@@ -372,19 +375,19 @@ re_miibus_writereg(device_t dev, int phy, int reg, uint16_t val)
 	int rv;
 
 	// s = splnet();
-	RE_LOCK(sc);
+	// RE_LOCK(sc);
 
 	if ((sc->sc_quirk & RTKQ_8139CPLUS) == 0) {
 		rv = re_gmii_writereg(dev, phy, reg, val);
 		// splx(s);
-		RE_UNLOCK(sc);
+		// RE_UNLOCK(sc);
 		return rv;
 	}
 
 	/* Pretend the internal PHY is only at address 0 */
 	if (phy) {
 		// splx(s);
-		RE_UNLOCK(sc);
+		// RE_UNLOCK(sc);
 		return -1;
 	}
 	switch (reg) {
@@ -410,18 +413,18 @@ re_miibus_writereg(device_t dev, int phy, int reg, uint16_t val)
 	case MII_PHYIDR1:
 	case MII_PHYIDR2:
 		// splx(s);
-		RE_UNLOCK(sc);
+		// RE_UNLOCK(sc);
 		return 0;
 		break;
 	default:
 		printf("%s: bad phy register\n", device_xname(sc->sc_dev));
 		// splx(s);
-		RE_UNLOCK(sc);
+		// RE_UNLOCK(sc);
 		return -1;
 	}
 	CSR_WRITE_2(sc, re8139_reg, val);
 	// splx(s);
-	RE_UNLOCK(sc);
+	// RE_UNLOCK(sc);
 	return 0;
 }
 
@@ -436,6 +439,8 @@ static void
 re_reset(struct rtk_softc *sc)
 {
 	int i;
+	
+	RE_LOCK_ASSERT(sc);
 
 	CSR_WRITE_1(sc, RTK_COMMAND, RTK_CMD_RESET);
 
@@ -512,10 +517,12 @@ re_diag(struct rtk_softc *sc)
 
 	ifp->if_flags |= IFF_PROMISC;
 	sc->re_testmode = 1;
-	re_init(ifp);
+	// re_init(ifp);
+	re_init_locked(ifp);
 	re_stop(ifp, 0);
 	DELAY(100000);
-	re_init(ifp);
+	// re_init(ifp);
+	re_init_locked(ifp);
 
 	/* Put some data in the mbuf */
 
@@ -1541,10 +1548,23 @@ re_txeof(struct rtk_softc *sc)
 		ifp->if_timer = 0;
 }
 
+
 static void
 re_tick(void *arg)
 {
 	struct rtk_softc *sc = arg;
+
+	RE_LOCK(sc);
+	re_tick_locked(sc);
+	RE_UNLOCK(sc);
+}
+
+static void
+re_tick_locked(void *arg)
+{
+	struct rtk_softc *sc = arg;
+
+	KASSERT(RE_LOCK_ASSERT(sc));
 	// int s;
 
 	/* XXX: just return for 8169S/8110S with rev 2 or newer phy */
@@ -1602,12 +1622,13 @@ re_intr(void *arg)
 			re_txeof(sc);
 
 		if (status & RTK_ISR_SYSTEM_ERR) {
-			re_init(ifp);
+			// re_init(ifp);
+			re_init_locked(ifp);
 		}
 
 		if (status & RTK_ISR_LINKCHG) {
 			callout_stop(&sc->rtk_tick_ch);
-			re_tick(sc);
+			re_tick_locked(sc);
 		}
 	}
 
@@ -1621,14 +1642,24 @@ re_intr(void *arg)
 	return handled;
 }
 
+static void
+re_start(struct ifnet *ifp)
+{
+	struct rtk_softc * const sc = ifp->if_softc;
 
+	KASSERT(IFNET_LOCKED(ifp));
+
+	RE_LOCK(sc);
+	re_start_locked(ifp);
+	RE_UNLOCK(sc);
+}
 
 /*
  * Main transmit routine for C+ and gigE NICs.
  */
 
 static void
-re_start(struct ifnet *ifp)
+re_start_locked(struct ifnet *ifp)
 {
 	struct rtk_softc *sc;
 	struct mbuf *m;
@@ -1643,7 +1674,8 @@ re_start(struct ifnet *ifp)
 	sc = ifp->if_softc;
 	ofree = sc->re_ldata.re_txq_free;
 
-	RE_LOCK(sc);
+	KASSERT(IFNET_LOCKED(ifp));
+	KASSERT(RE_LOCK_ASSERT(sc));
 
 	for (idx = sc->re_ldata.re_txq_prodidx;; idx = RE_NEXT_TXQ(sc, idx)) {
 
@@ -1886,16 +1918,32 @@ re_start(struct ifnet *ifp)
 		 */
 		ifp->if_timer = 5;
 	}
-	RE_UNLOCK(sc);
 }
 
 static int
-re_init(struct ifnet *ifp)
-{
+re_init(struct ifnet *ifp) {
+
+	struct rtk_softc * const sc = ifp->if_softc;
+
+	KASSERT(IFNET_LOCKED(ifp));
+
+	RE_LOCK(sc);
+	int ret = re_init_locked(sc);
+	RE_UNLOCK(sc);
+
+	return ret;
+}
+
+static int 
+re_int_locked(struct ifnet *ifp) {
 	struct rtk_softc *sc = ifp->if_softc;
 	uint32_t rxcfg = 0;
 	uint16_t cfg;
 	int error;
+
+	KASSERT(IFNET_LOCKED(ifp));
+	KASSERT(RE_LOCK_ASSERTED(sc));
+
 #ifdef RE_USE_EECMD
 	const uint8_t *enaddr;
 	uint32_t reg;
@@ -2146,7 +2194,7 @@ re_ioctl(struct ifnet *ifp, u_long command, void *data)
 	int error = 0;
 
 	// s = splnet();
-	RE_LOCK(sc);
+	// RE_LOCK(sc);
 
 	switch (command) {
 	case SIOCSIFMTU:
@@ -2176,12 +2224,14 @@ re_ioctl(struct ifnet *ifp, u_long command, void *data)
 		else if (command != SIOCADDMULTI && command != SIOCDELMULTI)
 			;
 		else if (ifp->if_flags & IFF_RUNNING)
+			RE_LOCK(sc);
 			rtk_setmulti(sc);
+			RE_UNLOCK(sc);
 		break;
 	}
 
 	// splx(s);
-	RE_UNLOCK(sc);
+	// RE_UNLOCK(sc);
 
 	return error;
 }
@@ -2201,7 +2251,8 @@ re_watchdog(struct ifnet *ifp)
 	re_txeof(sc);
 	re_rxeof(sc);
 
-	re_init(ifp);
+	// re_init(ifp);
+	re_init_locked(ifp);
 
 	// splx(s);
 	RE_UNLOCK(sc);
@@ -2217,7 +2268,8 @@ re_stop(struct ifnet *ifp, int disable)
 	int i;
 	struct rtk_softc *sc = ifp->if_softc;
 
-	RE_LOCK(sc);
+	// RE_LOCK(sc);
+	RE_LOCK_ASSERT(sc);
 
 	callout_stop(&sc->rtk_tick_ch);
 
@@ -2263,5 +2315,5 @@ re_stop(struct ifnet *ifp, int disable)
 	ifp->if_flags &= ~(IFF_RUNNING | IFF_OACTIVE);
 	ifp->if_timer = 0;
 
-	RE_UNLOCK(sc);
+	// RE_UNLOCK(sc);
 }
